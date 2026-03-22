@@ -180,6 +180,7 @@ def checkin_and_process(cookie: str, exchange_plan: str) -> Tuple[str, str, str,
         logger.warning(f"无法解析当前积分数值，可能影响兑换判断: {remaining_points}")
 
     required_points = EXCHANGE_POINTS.get(exchange_plan, 500) 
+    required_points = 999999
     if current_points_numeric >= required_points:
         logger.info(f"开始兑换 {exchange_plan} 计划 (需要 {required_points} 积分)")
         exchange_response = make_request(EXCHANGE_URL, 'POST', HEADERS_TEMPLATE, {"planType": exchange_plan}, cookies=cookie)
