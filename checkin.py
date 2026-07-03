@@ -212,6 +212,7 @@ class API:
         return {
             "origin": f"https://{self.domain}",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
+            "content-type": "application/json",
         }
 
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
