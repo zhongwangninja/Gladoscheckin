@@ -1,0 +1,116 @@
+name: auto check - my
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'imgs/**'
+  schedule:
+    # 拆成两条 cron，便于通过 github.event.schedule 区分是当天第几次执行
+    - cron: '0 4 * * *'   # 每天第一次（发邮件通知）
+    - cron: '0 10 * * *'  # 每天第二次（不通知）
+
+jobs:
+  build:
+    name: glados/railgun checkin
+    runs-on: ubuntu-latest
+      
+    permissions:
+      contents: read
+      actions: write
+
+    strategy:
+      matrix:
+        python-version: [3.13]
+
+    # 这里加入全局环境变量，强制后续所有第三方 actions 兼容 Node.js 24 运行环境
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v6
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    # 安装 python 库
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+        pip install pypushdeer
+
+    # 执行 签到脚本
+    - name: Running checkin
+      run: |
+        python checkin.py 2>&1 | tee /tmp/checkin.log
+      env:
+        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+
+    # 通过 Gmail SMTP 发送执行结果通知
+    # 依赖 secret: GMAIL_SMTP，格式为 sender@gmail.com|password|to@gmail.com
+    # 仅在每天第一次定时执行(04:00 UTC)、手动触发、push 时发送；第二次定时(10:00 UTC)跳过
+    - name: Notify via Gmail SMTP
+      if: ${{ github.event_name != 'schedule' || github.event.schedule == '0 4 * * *' }}
+      env:
+        GMAIL_SMTP: ${{ secrets.GMAIL_SMTP }}
+      run: |
+        python - <<'PY'
+        import os, re, smtplib
+        from email.mime.text import MIMEText
+        from email.header import Header
+
+        cfg = os.environ.get("GMAIL_SMTP", "").strip()
+        if not cfg:
+            print("GMAIL_SMTP 未设置，跳过邮件通知。")
+            raise SystemExit(0)
+
+        parts = [p.strip() for p in cfg.split("|")]
+        if len(parts) != 3 or not all(parts):
+            print("GMAIL_SMTP 格式错误，应为: sender@gmail.com|password|to@gmail.com")
+            raise SystemExit(0)
+        sender, password, to = parts
+
+        try:
+            with open("/tmp/checkin.log", encoding="utf-8") as f:
+                log = f.read()
+        except FileNotFoundError:
+            log = ""
+
+        # 提取“签到总结”段落；提取不到则回退到完整日志
+        m = re.search(r"签到总结\s*=+\s*\n(.*)", log, re.S)
+        body = m.group(1).strip() if m else (log.strip() or "无签到日志输出")
+
+        title_match = re.search(r"GLaDOS 签到[^\n]*", body)
+        subject = title_match.group(0).strip() if title_match else "GLaDOS 签到结果"
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = sender
+        msg["To"] = to
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as s:
+            s.login(sender, password)
+            s.sendmail(sender, [to], msg.as_string())
+        print("邮件通知发送成功。")
+        PY
+
+    - name: Keep alive
+      uses: liskin/gh-workflow-keepalive@v1 
+        
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        retain_days: 7
+        keep_minimum_runs: 7
+        delete_run_by_conclusion_pattern: success
