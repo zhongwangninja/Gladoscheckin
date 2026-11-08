@@ -1,0 +1,184 @@
+name: GLaDOS Check-in
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - 'README.md'
+      - 'imgs/**'
+  schedule:
+    - cron: '18 9,12 * * *'
+      timezone: 'Asia/Shanghai'
+
+# 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
+concurrency:
+  group: glados-checkin
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: glados/railgun checkin
+    runs-on: ubuntu-latest
+
+    # 脚本自带 5 分钟运行预算；这里再兜底，避免异常情况卡住
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      actions: write
+
+    strategy:
+      matrix:
+        python-version: [3.13]
+
+    # 这里加入全局环境变量，强制后续所有第三方 actions 兼容 Node.js 24 运行环境
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v6
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    # 安装 python 库
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # 执行 签到脚本（日志同时落盘，供邮件步骤解析「成功 / 失败 / 重复」计数）
+    # pipefail 保证 python 非零退出时这一步仍然变红；日志已落盘，邮件步骤按 always() 兜底
+    - name: Running checkin
+      id: checkin
+      run: |
+        set -o pipefail
+        python checkin.py 2>&1 | tee /tmp/run.log
+      env:
+        PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
+        SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+        GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+
+    # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
+    - name: Keep alive
+      if: ${{ !cancelled() }}
+      uses: liskin/gh-workflow-keepalive@v1 
+        
+    - name: Delete workflow runs
+      if: ${{ !cancelled() }}
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        retain_days: 7
+        keep_minimum_runs: 7
+        delete_run_by_conclusion_pattern: success
+
+    # 邮件通知：SMTP 凭证复用 lunes 同名 Secret；未配置时跳过，不影响签到结果
+    # 标题直接体现「全部成功」还是「成功 N/总数 · 失败 M」，重复签到计入成功
+    - name: Send email notification
+      if: ${{ !cancelled() }}
+      env:
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        SMTP_TO: ${{ secrets.SMTP_TO }}
+        SMTP_HOST: ${{ secrets.SMTP_HOST }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        RUN_NUMBER: ${{ github.run_number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        if [ -z "${SMTP_USER}" ] || [ -z "${SMTP_PASSWORD}" ] || [ -z "${SMTP_TO}" ]; then
+          echo "[!] 未配置 SMTP_USER / SMTP_PASSWORD / SMTP_TO，跳过邮件通知。"
+          exit 0
+        fi
+        python3 - <<'PYEOF'
+        import os, re, smtplib
+        from email.header import Header
+        from email.mime.text import MIMEText
+        from datetime import datetime, timezone, timedelta
+
+        run_num = os.environ.get("RUN_NUMBER", "?")
+        run_url = os.environ.get("RUN_URL", "")
+        bj = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M CST")
+
+        try:
+            with open("/tmp/run.log", encoding="utf-8", errors="replace") as f:
+                log = f.read()
+        except OSError:
+            log = ""
+
+        # 总结行：「GLaDOS 签到 · 成功 1 · 失败 1 · 重复 1」或「# 脚本执行出错 · 成功 ...」
+        # 取最后一次出现（重试/多次汇总会打印多行）
+        counts = re.findall(
+            r"(GLaDOS 签到|脚本执行出错)\s*·\s*成功\s*(\d+)\s*·\s*失败\s*(\d+)\s*·\s*重复\s*(\d+)",
+            log,
+        )
+        if counts:
+            marker, success, failed, repeat = counts[-1]
+            success, failed, repeat = int(success), int(failed), int(repeat)
+            # 重复签到等同于成功，故成功数合并统计
+            ok = success + repeat
+            total = ok + failed
+        else:
+            marker, success, failed, repeat, ok, total = "", 0, 0, 0, 0, 0
+
+        if not counts:
+            emoji, headline = "❌", f"脚本执行出错 (#{run_num})"
+            result_line = "脚本未产出签到结果（多为配置错误，详见下方日志）"
+        elif marker == "脚本执行出错":
+            # 全部账号已成功但脚本尾部报错时用 ⚠️，否则算失败
+            emoji = "⚠️" if failed == 0 else "❌"
+            headline = f"脚本出错 · 成功 {ok}/{total} · 失败 {failed} (#{run_num})"
+            result_line = f"脚本执行出错（成功 {ok}/{total}，失败 {failed}）"
+        elif failed == 0:
+            emoji, headline = "✅", f"全部成功 {ok}/{total} (#{run_num})"
+            result_line = f"全部成功（{ok}/{total}）"
+        elif ok == 0:
+            emoji, headline = "❌", f"全部失败 0/{total} (#{run_num})"
+            result_line = f"全部失败（0/{total}）"
+        else:
+            emoji, headline = "⚠️", f"成功 {ok}/{total} · 失败 {failed} (#{run_num})"
+            result_line = f"部分失败（成功 {ok}/{total}，失败 {failed}）"
+
+        if counts and repeat:
+            headline += f" · 重复 {repeat}"
+
+        # 单账号结果行由 Report.render() 输出，形如「#1  大号  ✅ 签到成功  glados.cloud  ...」
+        detail = [line.strip() for line in log.splitlines() if re.match(r"\s*#\d+\s\s", line)]
+        detail_text = "\n".join(detail) if detail else "(无单账号结果)"
+
+        body = (
+            f"GLaDOS 签到 Report\n"
+            f"========================\n"
+            f"结果:     {result_line}\n"
+            f"成功:     {ok}（签到 {success}，重复 {repeat}）\n"
+            f"失败:     {failed}\n"
+            f"总数:     {total}\n"
+            f"Run:      #{run_num}\n"
+            f"时间:     {bj}\n"
+            f"Workflow: {run_url}\n"
+            f"\n--- 账号结果 ---\n"
+            f"{detail_text}\n"
+            f"\n--- Run Log ---\n"
+            f"{log}\n"
+        )
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = os.environ["SMTP_USER"]
+        msg["To"] = os.environ["SMTP_TO"]
+        # 中文 + emoji 主题必须走 Header 编码，否则 Python 3 会按 ASCII 编码失败
+        msg["Subject"] = Header(f"{emoji} GLaDOS 签到: {headline}", "utf-8")
+
+        smtp_host = os.environ.get("SMTP_HOST") or "smtp.gmail.com"
+        smtp_port = int(os.environ.get("SMTP_PORT") or "465")
+        with smtplib.SMTP_SSL(smtp_host, smtp_port) as s:
+            s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+            s.send_message(msg)
+        print(f"[+] Email sent: {headline}")
+        PYEOF
